@@ -1,0 +1,175 @@
+name: Build and Release Goosestation (Multi-Platform)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags:
+      - 'v*' 
+  schedule:
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+
+jobs:
+  # 1. Calculate the version name once to share across all jobs
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.VERSION }}
+    steps:
+      - name: Get version
+        id: get_version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "VERSION=continuous-build" >> $GITHUB_OUTPUT
+          fi
+
+  # 2. Build the Windows Core
+  build-windows:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Codeberg Repo
+        run: |
+          git clone --depth 1 https://codeberg.org/hueponik/goosestation-builder builder
+
+      - name: Prepare directories
+        run: |
+          mkdir -p dist .cache
+          chmod -R 777 dist .cache
+          
+      - name: Cache Windows Build
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: ${{ runner.os }}-goose-win-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-goose-win-
+
+      - name: Build Docker Image
+        run: docker build -f builder/Dockerfile.windows -t goosestation-builder-win builder/
+
+      - name: Compile Windows Core
+        # The Makefile handles everything inside the container natively now
+        run: |
+          docker run --rm \
+            -v "$(pwd)/dist:/work/dist" \
+            -v "$(pwd)/.cache:/work/.cache" \
+            goosestation-builder-win windows
+            
+      - name: Package Windows Artifacts
+        run: |
+          # Copy the info file into the dist folder alongside the newly extracted DLL
+          if [ -f "builder/goosestation_libretro.info" ]; then
+            cp builder/goosestation_libretro.info dist/
+          fi
+
+      - name: Upload Windows Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: goosestation-windows
+          path: dist/*
+          if-no-files-found: error
+
+  # 3. Build the Linux Core
+  build-linux:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Codeberg Repo
+        run: |
+          git clone --depth 1 https://codeberg.org/hueponik/goosestation-builder builder
+
+      - name: Install apt dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            curl \
+            git \
+            ed \
+            pkg-config \
+            libzstd-dev \
+            libzip-dev \
+            libfreetype-dev \
+            libjpeg-turbo8-dev \
+            libpng-dev \
+            libwebp-dev \
+            zlib1g-dev \
+            libudev-dev \
+            libvulkan-dev \
+            libshaderc-dev \
+            glslang-tools \
+            libspirv-cross-c-shared-dev \
+            spirv-cross \
+            libgl-dev \
+            libglvnd-dev
+            
+      # Cache .cache/ inside the builder directory.
+      # Key covers the pinned upstream commit and dep-build script so it
+      # invalidates automatically when either changes.
+      - name: Cache .cache/
+        uses: actions/cache@v4
+        with:
+          path: builder/.cache
+          key: goosestation-linux-${{ hashFiles('builder/Makefile', 'builder/build-linux-deps.sh') }}
+          restore-keys: |
+            goosestation-linux-
+
+      - name: Build (make linux)
+        working-directory: builder
+        run: make linux
+
+      - name: Package Linux Artifacts
+        run: |
+          # 1. Handle the Core (.so)
+          FOUND_CORE=$(find builder/dist/ -name "*.so" | head -n 1)
+          if [ -z "$FOUND_CORE" ]; then
+            echo "Build failed: No .so file found."
+            exit 1
+          fi
+          
+          # Only move if it's not already named correctly/in the right spot
+          if [ "$FOUND_CORE" != "builder/dist/goosestation_libretro.so" ]; then
+            mv "$FOUND_CORE" builder/dist/goosestation_libretro.so
+          fi
+
+      - name: Upload Linux Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: goosestation-linux
+          path: builder/dist/goosestation_libretro.so
+          if-no-files-found: error
+
+  # 4. Gather everything and create the Release
+  release:
+    # This ensures the release job waits for BOTH build jobs to succeed
+    needs: [prepare, build-windows, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # By omitting the 'name' property, this action automatically downloads 
+      # ALL artifacts from the current workflow run into the specified path.
+      - name: Download All Build Assets
+        uses: actions/download-artifact@v4
+        with:
+          path: ./release-assets
+
+      - name: Continuous Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name == 'main' && 'latest' || github.ref_name }}
+          name: Goosestation Core ${{ needs.prepare.outputs.version }}
+          make_latest: true
+          overwrite_files: true # <--- ADD THIS LINE TO FIX THE ERROR
+          # We use ** to recursively search the folders it downloaded into
+          files: |
+            ./release-assets/**/goosestation_libretro.dll
+            ./release-assets/**/goosestation_libretro.so
+            ./release-assets/**/goosestation_libretro.info
+          draft: false
+          prerelease: false
